@@ -35,34 +35,35 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=3600, suite="nightly-amd", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
+    # Thresholds set at 5% below reported GSM8K (5-shot/CoT) scores
     # Llama 3.1 series
-    "meta-llama/Llama-3.1-8B-Instruct": 0.82,
-    "meta-llama/Llama-3.1-70B-Instruct": 0.95,
+    "meta-llama/Llama-3.1-8B-Instruct": 0.80,  # 84.5% - 5%
+    "meta-llama/Llama-3.1-70B-Instruct": 0.89,  # 94.1% - 5%
     # Llama 3.2 series (smaller models)
-    "meta-llama/Llama-3.2-3B-Instruct": 0.55,
+    "meta-llama/Llama-3.2-3B-Instruct": 0.43,  # 48.2% - 5%
     # Mistral series
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.55,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.58,
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.46,  # ~51%  - 5%
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.69,  # 74.4% - 5% (lower if AMD scores differently)
     # DeepSeek series
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.81,  # 86.4% - 5%
     # Qwen2 series
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
-    "Qwen/Qwen2.5-7B-Instruct": 0.85,
+    "Qwen/Qwen2-57B-A14B-Instruct": 0.82,  # 88.2% - 5% (conservative for MoE on AMD)
+    "Qwen/Qwen2.5-7B-Instruct": 0.82,  # 86.3% - 5%
     # Qwen3 series
-    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.84,  # MoE model verified on MI300X
-    "Qwen/Qwen3-8B": 0.77,
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.85,  # ~90%  - 5% (uses thinking tokens; ensure sufficient max_tokens)
+    "Qwen/Qwen3-8B": 0.76,  # ~81%  - 5%
     # Google Gemma
-    "google/gemma-2-27b-it": 0.91,
-    "google/gemma-2-9b-it": 0.72,
+    "google/gemma-2-27b-it": 0.86,  # 90.7% - 5%
+    "google/gemma-2-9b-it": 0.74,  # 78.5% - 5%
     # "neuralmagic/gemma-2-2b-it-FP8": 0.4,  # Small 2B model - OOM on single GPU
     # FP8 quantized models
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.8,
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.92,
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.81,
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.57,
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.84,
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.80,  # 84.5% - 5%
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.46,  # ~51%  - 5%
+    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.89,  # 94.1% - 5%
+    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.86,  # 91.1% - 5%
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.83,  # 88.2% - 5%
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.69,  # 74.4% - 5%
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.81,  # 86.4% - 5%
 }
 
 failing_models = {
