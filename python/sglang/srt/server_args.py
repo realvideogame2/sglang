@@ -139,6 +139,7 @@ ATTENTION_BACKEND_CHOICES = [
     "dual_chunk_flash_attn",
     # AMD specific
     "aiter",
+    "gluon",
     "wave",
     # Other platforms
     "intel_amx",
@@ -1850,11 +1851,12 @@ class ServerArgs:
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
+                "gluon",
                 "triton",
                 "ascend",
                 "trtllm_mha",
                 "intel_xpu",
-            }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
+            }, f"fa3, aiter, gluon, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1881,7 +1883,7 @@ class ServerArgs:
                 )
                 self.disable_hybrid_swa_memory = True
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
-                accepted_backends = ["fa3", "triton", "trtllm_mha"]
+                accepted_backends = ["fa3", "triton", "gluon", "trtllm_mha"]
                 assert (
                     self.attention_backend in accepted_backends
                 ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
@@ -3460,6 +3462,12 @@ class ServerArgs:
                     f"Attention backend not specified. Falling back to '{self.attention_backend}' for deterministic inference. "
                     f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
                 )
+            elif self.attention_backend == "gluon":
+                logger.warning(
+                    "Deterministic inference does not currently support gluon backend. "
+                    "Falling back to triton backend."
+                )
+                self.attention_backend = "triton"
             elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 # User explicitly specified an incompatible attention backend
                 raise ValueError(
@@ -3509,7 +3517,7 @@ class ServerArgs:
                     "Cuda graph is disabled for diffusion LLM inference on AMD GPUs"
                 )
                 self.disable_cuda_graph = True
-            if self.attention_backend not in ["triton", "aiter"]:
+            if self.attention_backend not in ["triton", "aiter", "gluon"]:
                 logger.warning(
                     "Attention backend is set to triton for diffusion LLM inference on AMD GPUs"
                 )

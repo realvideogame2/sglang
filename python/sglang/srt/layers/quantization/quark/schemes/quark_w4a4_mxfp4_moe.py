@@ -29,8 +29,11 @@ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
+# MXFP4 MoE runtime path relies on aiter on HIP.
+# Keep env var compatibility for non-HIP, but always enable on HIP to avoid
+# missing symbols (e.g. e8m0_shuffle) during weight post-processing.
+_use_aiter = _is_hip
+if _is_hip:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight

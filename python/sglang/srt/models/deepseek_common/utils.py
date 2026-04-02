@@ -44,7 +44,9 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
-_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+# DeepSeek MXFP4 on MI350X relies on gfx95-specific aiter paths even when
+# SGLANG_USE_AITER is not explicitly exported in the shell environment.
+_use_aiter_gfx95 = _is_hip and _is_gfx95_supported
 
 
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()

@@ -102,6 +102,43 @@ def create_triton_backend(runner):
         return TritonAttnBackend(runner)
 
 
+@register_attention_backend("gluon")
+def create_gluon_backend(runner):
+    import os
+
+    from sglang.srt.utils import is_gfx95_supported, is_hip
+
+    if not is_hip():
+        logger.warning(
+            "Gluon attention backend is only available on ROCm; "
+            "falling back to triton backend."
+        )
+        return create_triton_backend(runner)
+    if not is_gfx95_supported():
+        logger.warning(
+            "Gluon attention backend currently targets MI350 (gfx950) only; "
+            "falling back to triton backend."
+        )
+        return create_triton_backend(runner)
+    assert not runner.model_config.is_encoder_decoder, (
+        "Cross attention is not supported in the gluon attention backend. "
+        "Please use `--attention-backend flashinfer`."
+    )
+    if runner.server_args.enable_double_sparsity:
+        logger.warning(
+            "Double sparsity is not supported with the gluon backend; "
+            "falling back to triton backend."
+        )
+        return create_triton_backend(runner)
+
+    os.environ.setdefault("SGLANG_USE_GLUON_EXTEND", "1")
+    os.environ.setdefault("SGLANG_GLUON_MLA", "hybrid")
+
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+    return TritonAttnBackend(runner, force_gluon=True)
+
+
 @register_attention_backend("torch_native")
 def create_torch_native_backend(runner):
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend

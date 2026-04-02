@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+_HIPCC_PATH = "/opt/rocm/bin/hipcc"
+_HIPCC_PERL_DRIVER_PATH = "/opt/rocm/bin/hipcc.pl"
+# Some ROCm installs expose hipcc but miss hipcc.pl; treat this as
+# unavailable JIT toolchain and use native fallback.
+_USE_NATIVE_HIP_FALLBACK = is_hip() and (
+    (not os.path.exists(_HIPCC_PATH)) or (not os.path.exists(_HIPCC_PERL_DRIVER_PATH))
+)
 
 
 @cache_once
@@ -37,5 +47,12 @@ def resolve_future_token_ids_cuda(
 
     Supported dtypes: torch.int32, torch.int64.
     """
+    if _USE_NATIVE_HIP_FALLBACK:
+        input_ids[:] = torch.where(
+            input_ids < 0,
+            future_token_ids_map[torch.clamp(-input_ids, min=0)],
+            input_ids,
+        )
+        return
     module = _jit_resolve_future_token_ids_module(input_ids.dtype)
     module.resolve_future_token_ids(input_ids, future_token_ids_map)

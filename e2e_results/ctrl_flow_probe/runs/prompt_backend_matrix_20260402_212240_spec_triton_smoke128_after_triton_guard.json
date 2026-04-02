@@ -1,0 +1,13 @@
+[
+  {
+    "case": "triton_probe",
+    "spec": true,
+    "kv_cache_dtype": "fp8_e4m3",
+    "port": 32141,
+    "cmd": "/home/tussingh/venv-triton/bin/python -m sglang.launch_server --model-path /home/tussingh/DeepSeek-R1-MXFP4 --tp-size 8 --host 127.0.0.1 --port 32141 --trust-remote-code --chunked-prefill-size 131072 --disable-radix-cache --mem-fraction-static 0.8 --max-running-requests 64 --attention-backend aiter --kv-cache-dtype fp8_e4m3 --disable-overlap-schedule --disable-cuda-graph --speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4",
+    "server_log": "/home/tussingh/sglang_upstream_clean/e2e_results/ctrl_flow_probe/runs/prompt_backend_matrix_20260402_212240_spec_triton_smoke128_after_triton_guard_triton_probe.server.log",
+    "server_pid": 1274669,
+    "status": "launch_failed",
+    "error": "server exited code=-9"
+  }
+]

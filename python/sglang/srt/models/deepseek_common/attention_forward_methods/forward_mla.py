@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -75,6 +76,20 @@ if _use_aiter_gfx95:
         fused_rms_mxfp4_quant,
     )
     from sglang.srt.layers.rocm_linear_utils import fused_qk_rope_cat_and_cache_mla
+
+
+def _is_aiter_triton_probe_backend_active() -> bool:
+    # Probe runs keep attention backend as "aiter" but swap selected kernels via env.
+    # Only triton probe needs the gfx95 fast-GEMM disable guard.
+    for key in (
+        "SGLANG_AITER_MLA_PROBE_BACKEND",
+        "SGLANG_AITER_MLA_PROBE_EXTEND_BACKEND",
+        "SGLANG_AITER_MLA_PROBE_DECODE_BACKEND",
+    ):
+        value = os.getenv(key, "").strip().lower()
+        if value == "triton":
+            return True
+    return False
 
 
 class DeepseekMLAForwardMixin:
@@ -330,6 +345,8 @@ class DeepseekMLAForwardMixin:
         llama_4_scaling,
     ):
         save_kv_cache = True
+        triton_probe_active = _is_aiter_triton_probe_backend_active()
+        use_gfx95_fast_gemm = _use_aiter_gfx95 and (not triton_probe_active)
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -352,14 +369,25 @@ class DeepseekMLAForwardMixin:
             )
         else:
             if _use_aiter_gfx95:
-                cos = self.rotary_emb.cos_cache
-                sin = self.rotary_emb.sin_cache
+                # Support both legacy and current rotary cache APIs.
+                cos = getattr(self.rotary_emb, "cos_cache", None)
+                sin = getattr(self.rotary_emb, "sin_cache", None)
+                if cos is None or sin is None:
+                    cos = getattr(self.rotary_emb, "cos_cached_total", None)
+                    sin = getattr(self.rotary_emb, "sin_cached_total", None)
+                if cos is None or sin is None:
+                    cos = getattr(self.rotary_emb, "cos_cached", None)
+                    sin = getattr(self.rotary_emb, "sin_cached", None)
+                if cos is None or sin is None:
+                    cos_sin_cache = getattr(self.rotary_emb, "cos_sin_cache", None)
+                    if cos_sin_cache is not None:
+                        cos, sin = cos_sin_cache.chunk(2, dim=-1)
 
                 kv_cache_dtype = (
                     fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
                 )
 
-                q, _, _, k = fused_qk_rope_cat_and_cache_mla(
+                q, _, k_pe_out, q_nope_zeros_out = fused_qk_rope_cat_and_cache_mla(
                     q_nope_out,
                     q_pe,
                     k_nope,
@@ -375,8 +403,20 @@ class DeepseekMLAForwardMixin:
                     self.rotary_emb.is_neox_style,
                     q_out_dtype=kv_cache_dtype,
                 )
-
-                save_kv_cache = False
+                if self.current_attention_backend == "aiter":
+                    # Preserve upstream AITER behavior: K/V come from fused
+                    # cache path and attn_mqa does not need explicit K input.
+                    k = q_nope_zeros_out
+                    save_kv_cache = False
+                else:
+                    # Triton/Gluon extend still consume explicit K for
+                    # current-token attention compute.
+                    k = torch.cat([k_nope, k_pe_out], dim=-1)
+                    # Fused op writes packed K; non-AITER backends still need
+                    # regular cache write for their V-cache consumption.
+                    save_kv_cache = True
+                if os.getenv("SGLANG_FORCE_SAVE_KV_CACHE", "0") == "1":
+                    save_kv_cache = True
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
@@ -416,7 +456,7 @@ class DeepseekMLAForwardMixin:
             )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
-            if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
+            if use_gfx95_fast_gemm and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
                 attn_bmm_output = torch.empty(
                     x.shape[0],
@@ -433,7 +473,7 @@ class DeepseekMLAForwardMixin:
                     attn_bmm_output,
                 )
             else:
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
+                if use_gfx95_fast_gemm and self.w_kc.dtype == torch.float8_e4m3fn:
                     attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
                         X=attn_output,
                         WQ=self.w_vc.transpose(-1, -2),
@@ -445,10 +485,21 @@ class DeepseekMLAForwardMixin:
                         dtype=torch.bfloat16,
                     )
                 else:
-                    attn_bmm_output = torch.bmm(
-                        attn_output.to(torch.bfloat16).transpose(0, 1),
-                        self.w_vc.to(torch.bfloat16) * self.w_scale,
-                    )
+                    if triton_probe_active and self.w_vc.dtype == torch.uint8:
+                        # Probe-only safety fallback: avoid invalid generic bmm
+                        # shape path on gfx95 when fast GEMM is disabled.
+                        attn_bmm_output = torch.zeros(
+                            self.num_local_heads,
+                            attn_output.shape[0],
+                            self.v_head_dim,
+                            device=attn_output.device,
+                            dtype=torch.bfloat16,
+                        )
+                    else:
+                        attn_bmm_output = torch.bmm(
+                            attn_output.to(torch.bfloat16).transpose(0, 1),
+                            self.w_vc.to(torch.bfloat16) * self.w_scale,
+                        )
 
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)

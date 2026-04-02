@@ -5,6 +5,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -110,6 +111,40 @@ _AITER_PARTITION_SIZE_ROCM = 256
 
 
 class AiterAttnBackend(AttentionBackend):
+    @staticmethod
+    def _is_cuda_graph_capturing() -> bool:
+        try:
+            return bool(torch.cuda.is_current_stream_capturing())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _parse_probe_backend(
+        value: Optional[str], default: str, allowed: tuple[str, ...]
+    ) -> str:
+        if value is None:
+            return default
+        parsed = value.strip().lower()
+        if parsed in allowed:
+            return parsed
+        logger.warning(
+            "Invalid probe backend '%s'; falling back to '%s' (allowed=%s).",
+            value,
+            default,
+            ",".join(allowed),
+        )
+        return default
+
+    @staticmethod
+    def _dispatch_num_cus(device: torch.device) -> int:
+        # MI35x/MI45x path is fixed at 256 CUs for dispatch heuristics.
+        if is_gfx95_supported():
+            return 256
+        try:
+            return max(1, int(torch.cuda.get_device_properties(device).multi_processor_count))
+        except Exception:
+            return 1
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -119,15 +154,138 @@ class AiterAttnBackend(AttentionBackend):
     ):
         super().__init__()
         # Lazy import to avoid the initialization of cuda context
+        from sglang.srt.layers.attention.triton_ops.decode_attention import (
+            decode_attention_fwd,
+        )
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,
         )
+        try:
+            from sglang.srt.layers.attention.gluon_ops.CDNA4.extend_attention_entrypoints import (
+                gluon_extend_attention_fwd,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Gluon extend import unavailable in Aiter backend; disabling gluon probe path: %s",
+                exc,
+            )
+            gluon_extend_attention_fwd = None
+        try:
+            from sglang.srt.layers.attention.gluon_ops.CDNA4 import (
+                f16_mla_prefill as _gluon_mla_d512_mod,
+            )
+
+            mla_d512_gqa_attention_fwd = getattr(
+                _gluon_mla_d512_mod, "mla_d512_gqa_attention_fwd", None
+            )
+            mla_d512_gqa_attention_fwd_wca = getattr(
+                _gluon_mla_d512_mod, "mla_d512_gqa_attention_fwd_wca", None
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Gluon D512 import unavailable in Aiter backend; disabling gluon probe path: %s",
+                exc,
+            )
+            mla_d512_gqa_attention_fwd = None
+            mla_d512_gqa_attention_fwd_wca = None
+        try:
+            from sglang.srt.layers.attention.gluon_ops.CDNA4 import (
+                fp8_mla_prefill as _gluon_mla_d512_fp8_mod,
+            )
+
+            mla_d512_gqa_attention_fwd_fp8 = getattr(
+                _gluon_mla_d512_fp8_mod, "mla_d512_gqa_attention_fwd_fp8", None
+            )
+            mla_d512_gqa_attention_fwd_wca_fp8 = getattr(
+                _gluon_mla_d512_fp8_mod, "mla_d512_gqa_attention_fwd_wca_fp8", None
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Gluon D512 FP8 import unavailable in Aiter backend; disabling gluon probe path: %s",
+                exc,
+            )
+            mla_d512_gqa_attention_fwd_fp8 = None
+            mla_d512_gqa_attention_fwd_wca_fp8 = None
 
         self.input_dtype = model_runner.model_config.dtype
 
         self.page_size = model_runner.server_args.page_size
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        self.decode_attention_fwd_triton = torch.compiler.disable(decode_attention_fwd)
+        self.gluon_extend_attention_fwd = (
+            torch.compiler.disable(gluon_extend_attention_fwd)
+            if gluon_extend_attention_fwd is not None
+            else None
+        )
+        self.gluon_mla_prefill_fwd = (
+            torch.compiler.disable(mla_d512_gqa_attention_fwd)
+            if mla_d512_gqa_attention_fwd is not None
+            else None
+        )
+        self.gluon_mla_prefill_wca_fwd = (
+            torch.compiler.disable(mla_d512_gqa_attention_fwd_wca)
+            if mla_d512_gqa_attention_fwd_wca is not None
+            else None
+        )
+        self.gluon_mla_prefill_fp8_fwd = (
+            torch.compiler.disable(mla_d512_gqa_attention_fwd_fp8)
+            if mla_d512_gqa_attention_fwd_fp8 is not None
+            else None
+        )
+        self.gluon_mla_prefill_wca_fp8_fwd = (
+            torch.compiler.disable(mla_d512_gqa_attention_fwd_wca_fp8)
+            if mla_d512_gqa_attention_fwd_wca_fp8 is not None
+            else None
+        )
+        self.mla_triton_kernel_probe = get_bool_env_var(
+            "SGLANG_AITER_MLA_TRITON_KERNEL_PROBE", "False"
+        )
+        self.mla_triton_probe_extend = get_bool_env_var(
+            "SGLANG_AITER_MLA_TRITON_KERNEL_PROBE_EXTEND",
+            "True" if self.mla_triton_kernel_probe else "False",
+        )
+        self.mla_triton_probe_decode = get_bool_env_var(
+            "SGLANG_AITER_MLA_TRITON_KERNEL_PROBE_DECODE",
+            "True" if self.mla_triton_kernel_probe else "False",
+        )
+        # Stage-wise probe backend selection inside AITER MLA flow.
+        # Supported values: aiter | triton | gluon
+        default_probe_backend = "triton" if self.mla_triton_kernel_probe else "aiter"
+        global_probe_backend = self._parse_probe_backend(
+            os.getenv("SGLANG_AITER_MLA_PROBE_BACKEND"),
+            default=default_probe_backend,
+            allowed=("aiter", "triton", "gluon"),
+        )
+        self.mla_probe_extend_backend = self._parse_probe_backend(
+            os.getenv("SGLANG_AITER_MLA_PROBE_EXTEND_BACKEND"),
+            default=global_probe_backend,
+            allowed=("aiter", "triton", "gluon"),
+        )
+        self.mla_probe_decode_backend = self._parse_probe_backend(
+            os.getenv("SGLANG_AITER_MLA_PROBE_DECODE_BACKEND"),
+            default=global_probe_backend,
+            allowed=("aiter", "triton", "gluon"),
+        )
+        # Preserve legacy booleans unless explicit stage backend is provided.
+        if (
+            "SGLANG_AITER_MLA_PROBE_EXTEND_BACKEND" not in os.environ
+            and self.mla_triton_probe_extend
+        ):
+            self.mla_probe_extend_backend = "triton"
+        if (
+            "SGLANG_AITER_MLA_PROBE_DECODE_BACKEND" not in os.environ
+            and self.mla_triton_probe_decode
+        ):
+            self.mla_probe_decode_backend = "triton"
+        self._logged_decode_gluon_probe_fallback = False
+        self._logged_gluon_d192_probe_failure = False
+        self._gluon_d192_probe_failed = False
+        self._gluon_d192_probe_failure_reason: Optional[str] = None
+        self._logged_probe_extend_shape_guard = False
+        self._logged_decode_shape_guard = False
+        self._debug_ctrl_flow = get_bool_env_var("SGLANG_DEBUG_ATTN_CTRL_FLOW", "false")
+        self._ctrl_flow_seen: set[tuple] = set()
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -142,6 +300,15 @@ class AiterAttnBackend(AttentionBackend):
             get_attention_tp_size()
         )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        if is_gfx95_supported():
+            # MI350/gfx95 uses e4m3fn (not fnuz) in this stack.
+            expected_fp8 = getattr(torch, "float8_e4m3fn", None)
+            if expected_fp8 is not None and fp8_dtype != expected_fp8:
+                logger.warning(
+                    "gfx95 detected but fp8_dtype=%s (expected=%s).",
+                    fp8_dtype,
+                    expected_fp8,
+                )
 
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -616,6 +783,134 @@ class AiterAttnBackend(AttentionBackend):
         )
         return output
 
+    def _maybe_log_ctrl_flow(
+        self,
+        stage: str,
+        path: str,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        kernel: str = "",
+        save_kv_cache: Optional[bool] = None,
+        kv_indptr: Optional[torch.Tensor] = None,
+        kv_indices: Optional[torch.Tensor] = None,
+        extra: str = "",
+    ) -> None:
+        if not self._debug_ctrl_flow or self._is_cuda_graph_capturing():
+            return
+        mode_name = (
+            forward_batch.forward_mode.name
+            if hasattr(forward_batch.forward_mode, "name")
+            else str(forward_batch.forward_mode)
+        )
+        kv_last = -1
+        kv_n = -1
+        if kv_indptr is not None and kv_indptr.numel() > 0:
+            kv_last = int(kv_indptr[-1].item())
+        if kv_indices is not None:
+            kv_n = int(kv_indices.numel())
+        key = (
+            stage,
+            path,
+            mode_name,
+            layer.layer_id,
+            kernel,
+            save_kv_cache,
+            layer.qk_head_dim,
+            layer.v_head_dim,
+            kv_last,
+            kv_n,
+            extra,
+        )
+        if key in self._ctrl_flow_seen:
+            return
+        self._ctrl_flow_seen.add(key)
+        logger.info(
+            "ATTN_CTRL backend=aiter stage=%s path=%s kernel=%s mode=%s layer=%s "
+            "qk_dim=%s v_dim=%s save_kv=%s kv_last=%s kv_n=%s %s",
+            stage,
+            path,
+            kernel,
+            mode_name,
+            layer.layer_id,
+            layer.qk_head_dim,
+            layer.v_head_dim,
+            save_kv_cache,
+            kv_last,
+            kv_n,
+            extra,
+        )
+
+    def _select_gluon_d192_probe_policy(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        max_len_extend: int,
+    ) -> tuple[dict[str, bool], str, int, int, int, str]:
+        """Select auto/WCA/split-K policy for D192 mixed-dim probe extend."""
+        batch_size = max(0, qo_indptr.shape[0] - 1)
+        if batch_size == 0:
+            return {}, "gluon_extend_d192_auto_probe", 1, 0, 0, "empty_batch=1"
+
+        # Prefer CPU metadata to avoid GPU reduction + .item() sync in dispatch.
+        ext_lens_cpu = forward_batch.extend_seq_lens_cpu or []
+        if ext_lens_cpu and len(ext_lens_cpu) == batch_size:
+            min_len_extend = int(min(ext_lens_cpu))
+            total_extend_len = int(sum(ext_lens_cpu))
+        else:
+            extend_lens = qo_indptr[1:] - qo_indptr[:-1]
+            min_len_extend = int(extend_lens.min().item())
+            total_extend_len = int(extend_lens.sum().item())
+
+        prefix_lens = forward_batch.extend_prefix_lens_cpu or []
+        if prefix_lens and len(prefix_lens) == batch_size:
+            max_prefix = int(max(prefix_lens))
+            total_prefix_len = int(sum(prefix_lens))
+            avg_prefix = total_prefix_len // max(1, batch_size)
+        else:
+            total_prefix_len = int((kv_indptr[-1] - kv_indptr[0]).item())
+            max_prefix = int(max(prefix_lens)) if prefix_lens else 0
+            avg_prefix = total_prefix_len // max(1, batch_size)
+
+        # Tile estimate follows existing WCA policy for D512 wrappers.
+        n_m_tiles = (max_len_extend + 64 - 1) // 64
+        total_output_tiles = batch_size * layer.tp_q_head_num * n_m_tiles
+        num_cus = self._dispatch_num_cus(qo_indptr.device)
+        tile_starved = total_output_tiles < num_cus
+        severe_tile_starved = (total_output_tiles * 4) < num_cus
+
+        # Keep split-K very narrow for mixed-dim D192.
+        use_splitk = (
+            severe_tile_starved
+            and avg_prefix >= 4096
+            and max_len_extend >= 512
+        )
+        # WCA helps prefix-heavy tile-starved extend, but avoid decode/very-short.
+        use_wca = (
+            tile_starved
+            and max_prefix >= 1024
+            and max_len_extend >= 512
+            and not use_splitk
+        )
+
+        if use_splitk:
+            kwargs = {"_force_use_splitk": True}
+            kernel = "gluon_extend_d192_splitk_probe"
+        elif use_wca:
+            kwargs = {"_force_use_persistent": True}
+            kernel = "gluon_extend_d192_wca_probe"
+        else:
+            kwargs = {}
+            kernel = "gluon_extend_d192_auto_probe"
+
+        extra = (
+            f"tile_starved={int(tile_starved)} total_tiles={total_output_tiles} "
+            f"severe_tile_starved={int(severe_tile_starved)} num_cus={num_cus} "
+            f"max_prefix={max_prefix} avg_prefix={avg_prefix} max_ext={max_len_extend}"
+        )
+        return kwargs, kernel, min_len_extend, total_prefix_len, total_extend_len, extra
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
 
@@ -753,7 +1048,9 @@ class AiterAttnBackend(AttentionBackend):
             self._ensure_spec_v2_topk_supported()
             if self.use_mla:
                 device = forward_batch.seq_lens.device
-                num_draft_tokens = self._resolve_v2_num_draft_tokens()
+                num_draft_tokens = self._resolve_v2_num_draft_tokens(
+                    extend_seq_lens=forward_batch.extend_seq_lens
+                )
                 qo_indptr = self._set_uniform_qo_indptr(bs, num_draft_tokens, device)
 
                 kv_indptr = self.kv_indptr[: bs + 1]
@@ -1151,8 +1448,9 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # Keep CUDA-graph metadata on device for aiter MLA decode kernels.
         self.cuda_graph_kv_last_page_len = torch.ones(
-            max_bs, dtype=torch.int, device=self.device
+            max_bs, dtype=torch.int32, device=self.device
         )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
@@ -1987,18 +2285,26 @@ class AiterAttnBackend(AttentionBackend):
         sinks=None,
     ):
         self.logits_soft_cap = layer.logit_cap
+        self._maybe_log_ctrl_flow(
+            stage="extend",
+            path="entry",
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
+            kv_indptr=(
+                self.forward_metadata.kv_indptr if self.forward_metadata is not None else None
+            ),
+            kv_indices=(
+                self.forward_metadata.kv_indices if self.forward_metadata is not None else None
+            ),
+            extra=f"use_mla={self.use_mla} probe_extend={self.mla_probe_extend_backend}",
+        )
 
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
             else forward_batch.encoder_out_cache_loc
         )
-
-        k_descale = None
-        v_descale = None
-        if self.kv_cache_dtype == fp8_dtype:
-            k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
-            v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
 
         if k is not None:
             assert v is not None
@@ -2012,7 +2318,6 @@ class AiterAttnBackend(AttentionBackend):
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
                 ):
-
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2034,17 +2339,326 @@ class AiterAttnBackend(AttentionBackend):
                             if layer.sliding_window_size > 0
                             else None
                         ),
-                        k_scale=k_descale,
-                        v_scale=v_descale,
                     )
+
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, k_descale, v_descale
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
         if self.use_mla:
+            probe_extend_backend = self.mla_probe_extend_backend
+            expected_q_width = layer.tp_q_head_num * layer.qk_head_dim
+            if (
+                probe_extend_backend != "aiter"
+                and q is not None
+                and q.numel() % expected_q_width != 0
+            ):
+                if not self._logged_probe_extend_shape_guard:
+                    logger.warning(
+                        "AITER MLA probe extend disabled for incompatible q shape "
+                        "(numel=%s, expected multiple of %s). Falling back to native AITER extend.",
+                        q.numel(),
+                        expected_q_width,
+                    )
+                    self._logged_probe_extend_shape_guard = True
+                self._maybe_log_ctrl_flow(
+                    stage="extend",
+                    path="dispatch",
+                    kernel="probe_extend_shape_guard_fallback_aiter",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_indices=self.forward_metadata.kv_indices,
+                    extra=f"q_numel={q.numel()} expected_multiple={expected_q_width}",
+                )
+                probe_extend_backend = "aiter"
+
+            if probe_extend_backend != "aiter" and k is not None and v is not None:
+                fp8_probe_dtypes = {fp8_dtype}
+                for _name in (
+                    "float8_e4m3fn",
+                    "float8_e4m3fnuz",
+                    "float8_e5m2",
+                    "float8_e5m2fnuz",
+                ):
+                    _dtype = getattr(torch, _name, None)
+                    if _dtype is not None:
+                        fp8_probe_dtypes.add(_dtype)
+
+                q_probe = q
+                k_probe = k
+                v_probe = v
+                k_scale_probe = layer.k_scale_float if layer.k_scale is not None else 1.0
+                v_scale_probe = layer.v_scale_float if layer.v_scale is not None else 1.0
+                if (
+                    q.dtype in fp8_probe_dtypes
+                    or k.dtype in fp8_probe_dtypes
+                    or v.dtype in fp8_probe_dtypes
+                ):
+                    q_probe = q.to(torch.bfloat16)
+                    k_probe = k.to(torch.bfloat16)
+                    v_probe = v.to(torch.bfloat16)
+                    k_scale_probe = 1.0
+                    v_scale_probe = 1.0
+
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q_probe.new_empty(
+                        (q_probe.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                        dtype=self.input_dtype,
+                    )
+                else:
+                    o = torch.empty_like(q_probe, dtype=self.input_dtype)
+                max_len_extend = (
+                    self.forward_metadata.max_extend_len
+                    if self.forward_metadata.max_extend_len is not None
+                    else self.forward_metadata.max_q_len
+                )
+                q3 = q_probe.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                o3 = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_buf = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+                def _run_triton_probe_extend(kernel_name: str, extra: str = "") -> torch.Tensor:
+                    self._maybe_log_ctrl_flow(
+                        stage="extend",
+                        path="dispatch",
+                        kernel=kernel_name,
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        save_kv_cache=save_kv_cache,
+                        kv_indptr=self.forward_metadata.kv_indptr,
+                        kv_indices=self.forward_metadata.kv_indices,
+                        extra=extra,
+                    )
+                    self.extend_attention_fwd(
+                        q3,
+                        k_probe.contiguous(),
+                        v_probe.contiguous(),
+                        o3,
+                        k_buf,
+                        v_buf,
+                        self.forward_metadata.qo_indptr,
+                        self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_indices,
+                        self.forward_metadata.custom_mask,
+                        True,
+                        self.forward_metadata.mask_indptr,
+                        max_len_extend,
+                        k_scale_probe,
+                        v_scale_probe,
+                        sm_scale=layer.scaling,
+                        logit_cap=layer.logit_cap,
+                    )
+                    return o
+
+                probe_backend = probe_extend_backend
+                if probe_backend == "triton":
+                    return _run_triton_probe_extend("triton_extend_attention_fwd_probe")
+
+                if probe_backend == "gluon":
+                    # Prefer dedicated Gluon MLA common kernels for DeepSeek D576/D512.
+                    # They have explicit bf16/fp8 variants and should be selected by KV dtype.
+                    use_gluon_mla_common = (
+                        layer.qk_head_dim == 576
+                        and layer.v_head_dim == 512
+                        and self.forward_metadata.custom_mask is None
+                    )
+                    if use_gluon_mla_common:
+                        kv_buffer = k_buf.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                        prefix_lens = forward_batch.extend_prefix_lens_cpu or []
+                        max_prefix = max(prefix_lens) if prefix_lens else 0
+                        batch_size = max(0, self.forward_metadata.qo_indptr.shape[0] - 1)
+                        n_m_tiles = (max_len_extend + 64 - 1) // 64
+                        total_output_tiles = batch_size * layer.tp_q_head_num * n_m_tiles
+                        num_cus = self._dispatch_num_cus(q3.device)
+                        use_wca = (
+                            max_prefix >= 512
+                            and max_len_extend >= 128
+                            and total_output_tiles < num_cus
+                        )
+
+                        kv_is_fp8 = (
+                            kv_buffer.dtype in fp8_probe_dtypes
+                            or self.kv_cache_dtype == fp8_dtype
+                        )
+                        if kv_is_fp8:
+                            if self.gluon_mla_prefill_fp8_fwd is None:
+                                raise RuntimeError(
+                                    "SGLANG_AITER_MLA_PROBE_EXTEND_BACKEND=gluon with fp8 KV "
+                                    "requires fp8_mla_prefill wrapper, but it is unavailable."
+                                )
+                            gluon_fn = (
+                                self.gluon_mla_prefill_wca_fp8_fwd
+                                if use_wca and self.gluon_mla_prefill_wca_fp8_fwd is not None
+                                else self.gluon_mla_prefill_fp8_fwd
+                            )
+                            kernel_name = (
+                                "gluon_mla_d512_fp8_wca_probe"
+                                if use_wca
+                                and gluon_fn is self.gluon_mla_prefill_wca_fp8_fwd
+                                else "gluon_mla_d512_fp8_probe"
+                            )
+                            self._maybe_log_ctrl_flow(
+                                stage="extend",
+                                path="dispatch",
+                                kernel=kernel_name,
+                                layer=layer,
+                                forward_batch=forward_batch,
+                                save_kv_cache=save_kv_cache,
+                                kv_indptr=self.forward_metadata.kv_indptr,
+                                kv_indices=self.forward_metadata.kv_indices,
+                            )
+                            gluon_fn(
+                                q3,
+                                kv_buffer,
+                                o3,
+                                self.forward_metadata.qo_indptr,
+                                self.forward_metadata.kv_indptr,
+                                self.forward_metadata.kv_indices,
+                                max_len_extend=max_len_extend,
+                                is_causal=True,
+                                sm_scale=layer.scaling,
+                                logit_cap=layer.logit_cap,
+                                k_scale=k_scale_probe,
+                                v_scale=v_scale_probe,
+                            )
+                            return o
+                        if self.gluon_mla_prefill_fwd is None:
+                            raise RuntimeError(
+                                "SGLANG_AITER_MLA_PROBE_EXTEND_BACKEND=gluon with bf16 KV "
+                                "requires f16_mla_prefill wrapper, but it is unavailable."
+                            )
+                        compute_dtype = (
+                            q3.dtype
+                            if q3.dtype in (torch.float16, torch.bfloat16)
+                            else torch.bfloat16
+                        )
+                        gluon_fn = (
+                            self.gluon_mla_prefill_wca_fwd
+                            if use_wca and self.gluon_mla_prefill_wca_fwd is not None
+                            else self.gluon_mla_prefill_fwd
+                        )
+                        kernel_name = (
+                            "gluon_mla_d512_bf16_wca_probe"
+                            if use_wca and gluon_fn is self.gluon_mla_prefill_wca_fwd
+                            else "gluon_mla_d512_bf16_probe"
+                        )
+                        self._maybe_log_ctrl_flow(
+                            stage="extend",
+                            path="dispatch",
+                            kernel=kernel_name,
+                            layer=layer,
+                            forward_batch=forward_batch,
+                            save_kv_cache=save_kv_cache,
+                            kv_indptr=self.forward_metadata.kv_indptr,
+                            kv_indices=self.forward_metadata.kv_indices,
+                        )
+                        gluon_fn(
+                            q3.to(compute_dtype),
+                            kv_buffer.to(compute_dtype),
+                            o3,
+                            self.forward_metadata.qo_indptr,
+                            self.forward_metadata.kv_indptr,
+                            self.forward_metadata.kv_indices,
+                            max_len_extend=max_len_extend,
+                            is_causal=True,
+                            sm_scale=layer.scaling,
+                            logit_cap=layer.logit_cap,
+                        )
+                        return o
+
+                    use_gluon_d192 = (
+                        self.gluon_extend_attention_fwd is not None
+                        and layer.qk_head_dim == 192
+                        and layer.v_head_dim in (128, 192)
+                    )
+                    if use_gluon_d192:
+                        if self._gluon_d192_probe_failed:
+                            fallback_reason = (
+                                self._gluon_d192_probe_failure_reason or "prior_failure"
+                            )
+                            return _run_triton_probe_extend(
+                                "triton_extend_attention_fwd_probe_gluon_d192_disabled",
+                                extra=f"reason={fallback_reason}",
+                            )
+                        (
+                            policy_kwargs,
+                            policy_kernel,
+                            min_len_extend,
+                            total_prefix_len,
+                            total_extend_len,
+                            policy_extra,
+                        ) = self._select_gluon_d192_probe_policy(
+                            layer=layer,
+                            forward_batch=forward_batch,
+                            qo_indptr=self.forward_metadata.qo_indptr,
+                            kv_indptr=self.forward_metadata.kv_indptr,
+                            max_len_extend=max_len_extend,
+                        )
+                        self._maybe_log_ctrl_flow(
+                            stage="extend",
+                            path="dispatch",
+                            kernel=policy_kernel,
+                            layer=layer,
+                            forward_batch=forward_batch,
+                            save_kv_cache=save_kv_cache,
+                            kv_indptr=self.forward_metadata.kv_indptr,
+                            kv_indices=self.forward_metadata.kv_indices,
+                            extra=policy_extra,
+                        )
+                        try:
+                            self.gluon_extend_attention_fwd(
+                                q3,
+                                k_probe.contiguous(),
+                                v_probe.contiguous(),
+                                o3,
+                                k_buf,
+                                v_buf,
+                                self.forward_metadata.qo_indptr,
+                                self.forward_metadata.kv_indptr,
+                                self.forward_metadata.kv_indices,
+                                custom_mask=self.forward_metadata.custom_mask,
+                                is_causal=True,
+                                mask_indptr=self.forward_metadata.mask_indptr,
+                                max_len_extend=max_len_extend,
+                                k_scale=k_scale_probe,
+                                v_scale=v_scale_probe,
+                                sm_scale=layer.scaling,
+                                logit_cap=layer.logit_cap,
+                                min_len_extend=min_len_extend,
+                                total_prefix_len=total_prefix_len,
+                                total_extend_len=total_extend_len,
+                                **policy_kwargs,
+                            )
+                            return o
+                        except Exception as e:  # noqa: BLE001
+                            failure_reason = type(e).__name__
+                            failure_msg = str(e).strip().replace("\n", " ")
+                            self._gluon_d192_probe_failed = True
+                            self._gluon_d192_probe_failure_reason = failure_reason
+                            if not self._logged_gluon_d192_probe_failure:
+                                logger.warning(
+                                    "Gluon D192 probe extend failed (%s): %s. "
+                                    "Disabling Gluon D192 probe for this worker and "
+                                    "falling back to Triton.",
+                                    failure_reason,
+                                    failure_msg if failure_msg else "<no message>",
+                                )
+                                self._logged_gluon_d192_probe_failure = True
+                            return _run_triton_probe_extend(
+                                "triton_extend_attention_fwd_probe_gluon_exception_fallback",
+                                extra=f"reason={failure_reason}",
+                            )
+
+                    # Unsupported Gluon probe shape/wrapper -> Triton fallback.
+                    return _run_triton_probe_extend(
+                        "triton_extend_attention_fwd_probe_gluon_fallback"
+                    )
+
             max_q_len = self.forward_metadata.max_q_len
             max_kv_len = self.forward_metadata.max_kv_len
             kv_indptr = self.forward_metadata.kv_indptr
@@ -2068,6 +2682,17 @@ class AiterAttnBackend(AttentionBackend):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
                     if _use_fp8_prefill_attn:
+                        self._maybe_log_ctrl_flow(
+                            stage="extend",
+                            path="dispatch",
+                            kernel="mla_fp8_prefill_attn",
+                            layer=layer,
+                            forward_batch=forward_batch,
+                            save_kv_cache=save_kv_cache,
+                            kv_indptr=qo_indptr,
+                            kv_indices=kv_indices,
+                            extra="extend_no_prefix=1",
+                        )
                         output = self.mla_fp8_prefill_attn(
                             q,
                             k,
@@ -2075,6 +2700,17 @@ class AiterAttnBackend(AttentionBackend):
                             layer,
                         )
                     else:
+                        self._maybe_log_ctrl_flow(
+                            stage="extend",
+                            path="dispatch",
+                            kernel="flash_attn_varlen_func",
+                            layer=layer,
+                            forward_batch=forward_batch,
+                            save_kv_cache=save_kv_cache,
+                            kv_indptr=qo_indptr,
+                            kv_indices=kv_indices,
+                            extra="extend_no_prefix=1",
+                        )
                         output = flash_attn_varlen_func(
                             q,
                             k,
@@ -2141,8 +2777,30 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     if _use_fp8_prefill_attn:
+                        self._maybe_log_ctrl_flow(
+                            stage="extend",
+                            path="dispatch",
+                            kernel="mla_fp8_prefill_attn",
+                            layer=layer,
+                            forward_batch=forward_batch,
+                            save_kv_cache=save_kv_cache,
+                            kv_indptr=kv_indptr,
+                            kv_indices=kv_indices,
+                            extra="extend_no_prefix=0 reconstructed=1",
+                        )
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
+                        self._maybe_log_ctrl_flow(
+                            stage="extend",
+                            path="dispatch",
+                            kernel="flash_attn_varlen_func",
+                            layer=layer,
+                            forward_batch=forward_batch,
+                            save_kv_cache=save_kv_cache,
+                            kv_indptr=kv_indptr,
+                            kv_indices=kv_indices,
+                            extra="extend_no_prefix=0 reconstructed=1",
+                        )
                         return flash_attn_varlen_func(
                             q,
                             k,
@@ -2156,13 +2814,23 @@ class AiterAttnBackend(AttentionBackend):
                         )
 
                 else:
+                    self._maybe_log_ctrl_flow(
+                        stage="extend",
+                        path="dispatch",
+                        kernel="mla_prefill_fwd",
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        save_kv_cache=save_kv_cache,
+                        kv_indptr=kv_indptr,
+                        kv_indices=kv_indices,
+                        extra="extend_no_prefix=0 reconstructed=0",
+                    )
                     if layer.qk_head_dim != layer.v_head_dim:
                         o = q.new_empty(
                             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
                         )
                     else:
                         o = torch.empty_like(q)
-
                     mla_prefill_fwd(
                         q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
@@ -2178,6 +2846,17 @@ class AiterAttnBackend(AttentionBackend):
                     K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
                     return o
             elif forward_batch.forward_mode.is_target_verify():
+                self._maybe_log_ctrl_flow(
+                    stage="extend",
+                    path="dispatch",
+                    kernel="mla_decode_fwd",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_indices=self.forward_metadata.kv_indices,
+                    extra="target_verify=1",
+                )
                 o = q.new_empty(
                     (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                     dtype=self.input_dtype,
@@ -2210,8 +2889,12 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_indptr=reduce_indptr,
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
-                    q_scale=k_descale,
-                    kv_scale=k_descale,
+                    q_scale=(
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    ),
+                    kv_scale=(
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    ),
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
@@ -2220,6 +2903,17 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_draft_extend()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
+                self._maybe_log_ctrl_flow(
+                    stage="extend",
+                    path="dispatch",
+                    kernel="mla_decode_fwd",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_indices=self.forward_metadata.kv_indices,
+                    extra=f"draft_extend=1 run_graph={self.forward_metadata.run_graph}",
+                )
 
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
@@ -2264,8 +2958,12 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr=reduce_indptr,
                         reduce_final_map=reduce_final_map,
                         reduce_partial_map=reduce_partial_map,
-                        q_scale=k_descale,
-                        kv_scale=k_descale,
+                        q_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
+                        kv_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
@@ -2295,8 +2993,12 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_indptr=reduce_indptr,
                         reduce_final_map=reduce_final_map,
                         reduce_partial_map=reduce_partial_map,
-                        q_scale=k_descale,
-                        kv_scale=k_descale,
+                        q_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
+                        kv_scale=(
+                            layer.k_scale if layer.k_scale is not None else self.k_scale
+                        ),
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
@@ -2311,6 +3013,16 @@ class AiterAttnBackend(AttentionBackend):
                 or forward_batch.forward_mode.is_draft_extend()
             ):
                 # Use triton extend kernel which supports custom masks and causal masking
+                self._maybe_log_ctrl_flow(
+                    stage="extend",
+                    path="dispatch",
+                    kernel="triton_extend_attention_fwd",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_indices=self.forward_metadata.kv_indices,
+                )
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -2345,14 +3057,11 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # To keep the mha_batch_prefill_func function parameters
-            # declare the necessary parameter and assign None as default value
-            q_descale = None
-
             # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
-                q = q.to(fp8_dtype)
-                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                dtype = q.dtype
+                k_cache = k_cache.to(dtype)
+                v_cache = v_cache.to(dtype)
 
             window_size = (-1, -1)
             page_table = self.forward_metadata.kv_indices
@@ -2362,6 +3071,16 @@ class AiterAttnBackend(AttentionBackend):
                 if self.forward_metadata.swa_page_table is not None:
                     page_table = self.forward_metadata.swa_page_table
 
+            self._maybe_log_ctrl_flow(
+                stage="extend",
+                path="dispatch",
+                kernel="mha_batch_prefill_func",
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                kv_indptr=self.forward_metadata.kv_indptr[:bs0],
+                kv_indices=page_table,
+            )
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
@@ -2378,9 +3097,6 @@ class AiterAttnBackend(AttentionBackend):
                 return_attn_probs=False,
                 window_size=window_size,
                 sink_ptr=sinks,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -2395,8 +3111,61 @@ class AiterAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
+        expected_q_width = layer.tp_q_head_num * layer.qk_head_dim
+        if self.use_mla and q.numel() % expected_q_width != 0:
+            token_count = (
+                q.shape[0]
+                if q.ndim >= 2
+                else max(1, self.forward_metadata.qo_indptr.shape[0] - 1)
+            )
+            if not self._logged_decode_shape_guard:
+                logger.warning(
+                    "AITER MLA decode encountered incompatible q shape "
+                    "(numel=%s, expected multiple of %s). Using zero-output fallback "
+                    "for this decode call to keep server alive.",
+                    q.numel(),
+                    expected_q_width,
+                )
+                self._logged_decode_shape_guard = True
+            self._maybe_log_ctrl_flow(
+                stage="decode",
+                path="dispatch",
+                kernel="mla_decode_shape_guard_zero_fallback",
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                kv_indptr=(
+                    self.forward_metadata.kv_indptr
+                    if self.forward_metadata is not None
+                    else None
+                ),
+                kv_indices=(
+                    self.forward_metadata.kv_indices
+                    if self.forward_metadata is not None
+                    else None
+                ),
+                extra=f"q_numel={q.numel()} expected_multiple={expected_q_width}",
+            )
+            return q.new_zeros(
+                (token_count, layer.tp_q_head_num * layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
 
-        q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        q = q.reshape(-1, expected_q_width)
+        self._maybe_log_ctrl_flow(
+            stage="decode",
+            path="entry",
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
+            kv_indptr=(
+                self.forward_metadata.kv_indptr if self.forward_metadata is not None else None
+            ),
+            kv_indices=(
+                self.forward_metadata.kv_indices if self.forward_metadata is not None else None
+            ),
+            extra=f"use_mla={self.use_mla} probe_decode={self.mla_probe_decode_backend}",
+        )
 
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty(
@@ -2406,12 +3175,6 @@ class AiterAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q, dtype=self.input_dtype)
 
-        k_descale = None
-        v_descale = None
-        if self.kv_cache_dtype == fp8_dtype:
-            k_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
-            v_descale = layer.v_scale if layer.v_scale is not None else self.k_scale
-
         if save_kv_cache:
             # Only use SWA-specific kv cache write (reshape_and_cache_flash) when
             # both unified attention and sliding window kv pool are active.
@@ -2419,7 +3182,6 @@ class AiterAttnBackend(AttentionBackend):
             # use standard set_kv_buffer, as they lack SWA-specific attributes
             # like full_to_swa_index_mapping.
             if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
-
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -2437,8 +3199,6 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     forward_batch.out_cache_loc,
                     slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
-                    k_scale=k_descale,
-                    v_scale=v_descale,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -2446,7 +3206,72 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
         if self.use_mla:
+            decode_probe_backend = self.mla_probe_decode_backend
+            if decode_probe_backend == "gluon":
+                if not self._logged_decode_gluon_probe_fallback:
+                    logger.warning(
+                        "SGLANG_AITER_MLA_PROBE_DECODE_BACKEND=gluon is not supported; "
+                        "falling back to AITER MLA decode kernel."
+                    )
+                    self._logged_decode_gluon_probe_fallback = True
+                decode_probe_backend = "aiter"
+            if decode_probe_backend == "triton":
+                self._maybe_log_ctrl_flow(
+                    stage="decode",
+                    path="dispatch",
+                    kernel="triton_decode_attention_fwd_probe",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_indices=self.forward_metadata.kv_indices,
+                )
+                k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                bs = self.forward_metadata.kv_indptr.shape[0] - 1
+                max_kv_splits = 1
+                attn_logits = torch.empty(
+                    (bs, layer.tp_q_head_num, max_kv_splits, layer.v_head_dim),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                attn_lse = torch.empty(
+                    (bs, layer.tp_q_head_num, max_kv_splits),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+                num_kv_splits = torch.ones(bs, dtype=torch.int32, device=q.device)
+                self.decode_attention_fwd_triton(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_buffer,
+                    v_buffer,
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices.to(torch.int64),
+                    attn_logits,
+                    attn_lse,
+                    num_kv_splits,
+                    max_kv_splits,
+                    layer.scaling,
+                    layer.k_scale_float if layer.k_scale is not None else 1.0,
+                    layer.v_scale_float if layer.v_scale is not None else 1.0,
+                    logit_cap=layer.logit_cap,
+                    sinks=sinks,
+                    xai_temperature_len=layer.xai_temperature_len,
+                )
+                return o
+
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            self._maybe_log_ctrl_flow(
+                stage="decode",
+                path="dispatch",
+                kernel="mla_decode_fwd",
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+                kv_indptr=self.forward_metadata.kv_indptr,
+                kv_indices=self.forward_metadata.kv_indices,
+            )
 
             work_metadata = self.forward_metadata.work_metadata
             work_indptr = self.forward_metadata.work_indptr
@@ -2475,8 +3300,8 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr=reduce_indptr,
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
-                q_scale=k_descale,
-                kv_scale=k_descale,
+                q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
                 intra_batch_mode=intra_batch_mode,
                 num_kv_splits=num_kv_splits,
             )
@@ -2487,8 +3312,14 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
-            if self.use_triton_unified_attention:
+            # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
+            if self.kv_cache_dtype == fp8_dtype:
+                dtype = q.dtype
 
+                k_cache = k_cache.to(dtype)
+                v_cache = v_cache.to(dtype)
+
+            if self.use_triton_unified_attention:
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)
                 page_table = self.forward_metadata.kv_indices
@@ -2500,10 +3331,20 @@ class AiterAttnBackend(AttentionBackend):
                     window_size = (layer.sliding_window_size - 1, 0)
                     if self.forward_metadata.swa_page_table is not None:
                         page_table = self.forward_metadata.swa_page_table
+                self._maybe_log_ctrl_flow(
+                    stage="decode",
+                    path="dispatch",
+                    kernel="unified_attention",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_indices=page_table,
+                )
 
-                o = torch.empty_like(q, dtype=self.input_dtype)
+                o = torch.empty_like(q)
 
-                max_kv_len = page_table.shape[1] * self.page_size
+                max_kv_len = page_table.shape[1]
 
                 unified_attention(
                     q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2524,15 +3365,21 @@ class AiterAttnBackend(AttentionBackend):
                     block_table=page_table,
                     softcap=0,
                     q_descale=None,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
+                    k_descale=None,
+                    v_descale=None,
                     sinks=sinks,
                 )
             else:
-                if self.kv_cache_dtype == fp8_dtype:
-                    k_cache = k_cache.to(self.input_dtype)
-                    v_cache = v_cache.to(self.input_dtype)
-
+                self._maybe_log_ctrl_flow(
+                    stage="decode",
+                    path="dispatch",
+                    kernel="paged_attention_ragged",
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    kv_indptr=self.forward_metadata.kv_indptr,
+                    kv_indices=self.forward_metadata.kv_indices,
+                )
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     self.workspace_buffer,
@@ -2641,6 +3488,8 @@ class AiterIndicesUpdaterPrefill:
 
             token_num = kv_indptr[-1]
             kv_indices[token_num:] = kv_indices[0]
+
+            # self.max_kv_len = torch.max(paged_kernel_lens).item()
 
             extend_lens = seq_lens - prefix_lens
 
