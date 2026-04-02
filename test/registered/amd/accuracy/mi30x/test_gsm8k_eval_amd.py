@@ -42,15 +42,15 @@ MODEL_SCORE_THRESHOLDS = {
     # Llama 3.2 series (smaller models)
     "meta-llama/Llama-3.2-3B-Instruct": 0.43,  # 48.2% - 5%
     # Mistral series
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.46,  # ~51%  - 5%
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.47,  # 52.1% - 5%
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.69,  # 74.4% - 5% (lower if AMD scores differently)
     # DeepSeek series
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.81,  # 86.4% - 5%
     # Qwen2 series
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.82,  # 88.2% - 5% (conservative for MoE on AMD)
+    "Qwen/Qwen2-57B-A14B-Instruct": 0.76,  # 80.7% - 5% (official A14B score; 88.2% was the 72B)
     "Qwen/Qwen2.5-7B-Instruct": 0.82,  # 86.3% - 5%
     # Qwen3 series
-    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.85,  # ~90%  - 5% (uses thinking tokens; ensure sufficient max_tokens)
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.86,  # 91.4% - 5% (full attention mode; ensure sufficient max_tokens)
     "Qwen/Qwen3-8B": 0.76,  # ~81%  - 5%
     # Google Gemma
     "google/gemma-2-27b-it": 0.86,  # 90.7% - 5%
@@ -61,7 +61,7 @@ MODEL_SCORE_THRESHOLDS = {
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.46,  # ~51%  - 5%
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.89,  # 94.1% - 5%
     "neuralmagic/Qwen2-72B-Instruct-FP8": 0.86,  # 91.1% - 5%
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.83,  # 88.2% - 5%
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.76,  # 80.7% - 5% (official A14B score)
     "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.69,  # 74.4% - 5%
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.81,  # 86.4% - 5%
 }
