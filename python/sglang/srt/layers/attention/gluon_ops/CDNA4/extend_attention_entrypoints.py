@@ -517,7 +517,7 @@ def gluon_extend_attention_fwd(
                 ):
                     _BM, _NW, _NS = 128, 8, 2
                 elif batch_size >= 2 and max_len_extend < 512:
-                    _BM, _NW, _NS = 64, 4, 3
+                    _BM, _NW, _NS = 64, 4, 2
                 else:
                     _BM, _NW, _NS = 64, 4, 2
         elif Lq == 256:
@@ -819,7 +819,7 @@ def gluon_extend_attention_fwd(
         BLOCK_N = 32 if max(BLOCK_DMODEL, BLOCK_DV) >= 256 else 64
     if _force_block_n is not None:
         BLOCK_N = _force_block_n
-    if _kv_is_fp8 and max(BLOCK_DMODEL, BLOCK_DV) < 256:
+    if _kv_is_fp8 and max(BLOCK_DMODEL, BLOCK_DV) < 256 and Lq == Lv:
         BLOCK_N = 128
     EXT_BLOCK_N = BLOCK_N
     AUTO_PAD_K, AUTO_PAD_V = (16, 16)

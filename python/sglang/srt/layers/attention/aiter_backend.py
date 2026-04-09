@@ -206,6 +206,15 @@ class AiterAttnBackend(AttentionBackend):
             )
             mla_d512_gqa_attention_fwd_fp8 = None
             mla_d512_gqa_attention_fwd_wca_fp8 = None
+        try:
+            from sglang.srt.layers.attention.gluon_ops.CDNA4.mla_prefill_d192 import (
+                mla_d192_prefill_fwd,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Gluon D192 MLA prefill import unavailable: %s", exc,
+            )
+            mla_d192_prefill_fwd = None
 
         self.input_dtype = model_runner.model_config.dtype
 
@@ -236,6 +245,11 @@ class AiterAttnBackend(AttentionBackend):
         self.gluon_mla_prefill_wca_fp8_fwd = (
             torch.compiler.disable(mla_d512_gqa_attention_fwd_wca_fp8)
             if mla_d512_gqa_attention_fwd_wca_fp8 is not None
+            else None
+        )
+        self.gluon_mla_d192_prefill_fwd = (
+            torch.compiler.disable(mla_d192_prefill_fwd)
+            if mla_d192_prefill_fwd is not None
             else None
         )
         self.mla_triton_kernel_probe = get_bool_env_var(
@@ -2436,16 +2450,26 @@ class AiterAttnBackend(AttentionBackend):
                 v_probe = v
                 k_scale_probe = layer.k_scale_float if layer.k_scale is not None else 1.0
                 v_scale_probe = layer.v_scale_float if layer.v_scale is not None else 1.0
-                if (
+                _any_fp8 = (
                     q.dtype in fp8_probe_dtypes
                     or k.dtype in fp8_probe_dtypes
                     or v.dtype in fp8_probe_dtypes
-                ):
+                )
+                _gluon_mixed_dim_can_fp8 = (
+                    probe_extend_backend == "gluon"
+                    and layer.qk_head_dim != layer.v_head_dim
+                    and self.gluon_extend_attention_fwd is not None
+                )
+                if _any_fp8 and not _gluon_mixed_dim_can_fp8:
                     q_probe = q.to(torch.bfloat16)
                     k_probe = k.to(torch.bfloat16)
                     v_probe = v.to(torch.bfloat16)
                     k_scale_probe = 1.0
                     v_scale_probe = 1.0
+                elif _any_fp8:
+                    if q.dtype in fp8_probe_dtypes:
+                        q_probe = q.to(torch.bfloat16)
+                    # K/V stay FP8 for Gluon mixed-dim kernels (D192 extend, etc.)
 
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q_probe.new_empty(
@@ -2529,9 +2553,8 @@ class AiterAttnBackend(AttentionBackend):
                         )
                         if kv_is_fp8:
                             if self.gluon_mla_prefill_fp8_fwd is None:
-                                raise RuntimeError(
-                                    "SGLANG_AITER_MLA_PROBE_EXTEND_BACKEND=gluon with fp8 KV "
-                                    "requires fp8_mla_prefill wrapper, but it is unavailable."
+                                return _run_triton_probe_extend(
+                                    "triton_extend_attention_fwd_probe_gluon_d512_fp8_unavail"
                                 )
                             gluon_fn = (
                                 self.gluon_mla_prefill_wca_fp8_fwd
@@ -2570,9 +2593,8 @@ class AiterAttnBackend(AttentionBackend):
                             )
                             return o
                         if self.gluon_mla_prefill_fwd is None:
-                            raise RuntimeError(
-                                "SGLANG_AITER_MLA_PROBE_EXTEND_BACKEND=gluon with bf16 KV "
-                                "requires f16_mla_prefill wrapper, but it is unavailable."
+                            return _run_triton_probe_extend(
+                                "triton_extend_attention_fwd_probe_gluon_d512_bf16_unavail"
                             )
                         compute_dtype = (
                             q3.dtype
@@ -2613,8 +2635,12 @@ class AiterAttnBackend(AttentionBackend):
                         )
                         return o
 
+                    _has_d192_wrapper = (
+                        self.gluon_mla_d192_prefill_fwd is not None
+                        or self.gluon_extend_attention_fwd is not None
+                    )
                     use_gluon_d192 = (
-                        self.gluon_extend_attention_fwd is not None
+                        _has_d192_wrapper
                         and layer.qk_head_dim == 192
                         and layer.v_head_dim in (128, 192)
                     )
@@ -2641,6 +2667,15 @@ class AiterAttnBackend(AttentionBackend):
                             kv_indptr=self.forward_metadata.kv_indptr,
                             max_len_extend=max_len_extend,
                         )
+                        _use_d192_prefill = (
+                            self.gluon_mla_d192_prefill_fwd is not None
+                            and not policy_kwargs
+                            and layer.v_head_dim == 128
+                        )
+                        if _use_d192_prefill:
+                            policy_kernel = policy_kernel.replace(
+                                "gluon_extend_d192", "gluon_mla_d192_prefill"
+                            )
                         self._maybe_log_ctrl_flow(
                             stage="extend",
                             path="dispatch",
@@ -2653,29 +2688,50 @@ class AiterAttnBackend(AttentionBackend):
                             extra=policy_extra,
                         )
                         try:
-                            self.gluon_extend_attention_fwd(
-                                q3,
-                                k_probe.contiguous(),
-                                v_probe.contiguous(),
-                                o3,
-                                k_buf,
-                                v_buf,
-                                self.forward_metadata.qo_indptr,
-                                self.forward_metadata.kv_indptr,
-                                self.forward_metadata.kv_indices,
-                                custom_mask=self.forward_metadata.custom_mask,
-                                is_causal=True,
-                                mask_indptr=self.forward_metadata.mask_indptr,
-                                max_len_extend=max_len_extend,
-                                k_scale=k_scale_probe,
-                                v_scale=v_scale_probe,
-                                sm_scale=layer.scaling,
-                                logit_cap=layer.logit_cap,
-                                min_len_extend=min_len_extend,
-                                total_prefix_len=total_prefix_len,
-                                total_extend_len=total_extend_len,
-                                **policy_kwargs,
-                            )
+                            if _use_d192_prefill:
+                                self.gluon_mla_d192_prefill_fwd(
+                                    q3,
+                                    k_probe.contiguous(),
+                                    v_probe.contiguous(),
+                                    o3,
+                                    k_buf,
+                                    v_buf,
+                                    self.forward_metadata.qo_indptr,
+                                    self.forward_metadata.kv_indptr,
+                                    self.forward_metadata.kv_indices,
+                                    is_causal=True,
+                                    sm_scale=layer.scaling,
+                                    k_scale=k_scale_probe,
+                                    v_scale=v_scale_probe,
+                                    max_len_extend=max_len_extend,
+                                    min_len_extend=min_len_extend,
+                                    total_prefix_len=total_prefix_len,
+                                    total_extend_len=total_extend_len,
+                                )
+                            else:
+                                self.gluon_extend_attention_fwd(
+                                    q3,
+                                    k_probe.contiguous(),
+                                    v_probe.contiguous(),
+                                    o3,
+                                    k_buf,
+                                    v_buf,
+                                    self.forward_metadata.qo_indptr,
+                                    self.forward_metadata.kv_indptr,
+                                    self.forward_metadata.kv_indices,
+                                    custom_mask=self.forward_metadata.custom_mask,
+                                    is_causal=True,
+                                    mask_indptr=self.forward_metadata.mask_indptr,
+                                    max_len_extend=max_len_extend,
+                                    k_scale=k_scale_probe,
+                                    v_scale=v_scale_probe,
+                                    sm_scale=layer.scaling,
+                                    logit_cap=layer.logit_cap,
+                                    min_len_extend=min_len_extend,
+                                    total_prefix_len=total_prefix_len,
+                                    total_extend_len=total_extend_len,
+                                    **policy_kwargs,
+                                )
                             return o
                         except Exception as e:  # noqa: BLE001
                             failure_reason = type(e).__name__
