@@ -5,6 +5,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -129,6 +130,20 @@ class AiterAttnBackend(AttentionBackend):
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
 
+        # Opt-in Gluon MLA prefill (D192) replacement for
+        # mla_prefill_ps_asm_fwd + mla_reduce_v1. Requires the model to
+        # already be on the FP8 prefill path (see
+        # SGLANG_AITER_FP8_PREFILL_ATTN). Falls back to ASM on any
+        # import / shape mismatch so behaviour is conservative.
+        self._use_gluon_for_mla_prefill = get_bool_env_var(
+            "SGLANG_AITER_USE_GLUON_MLA_PREFILL"
+        )
+        self._gluon_mla_prefill_fn = None
+        # Set by forward_extend when it's safe to use Gluon for MLA
+        # prefill. Defaults True so non-MTP paths (which never touch
+        # this) still work.
+        self._gluon_mla_allowed = True
+
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
@@ -183,6 +198,49 @@ class AiterAttnBackend(AttentionBackend):
             (max_bs + 1,), dtype=torch.int64, device=model_runner.device
         )
         self._kv_indices_scratch: Optional[torch.Tensor] = None
+
+        if self._use_gluon_for_mla_prefill:
+            try:
+                from sglang.srt.layers.attention.gluon_mla_prefill import (
+                    gluon_mla_fp8_prefill_attn as _gluon_mla_fn,
+                    is_gluon_mla_available as _gluon_mla_ok,
+                    prewarm_mla as _gluon_mla_prewarm,
+                )
+
+                if _gluon_mla_ok():
+                    self._gluon_mla_prefill_fn = _gluon_mla_fn
+                    try:
+                        # Pass num_heads so the prewarm specializes on
+                        # the same (num_heads, num_CUs) tuple the
+                        # runtime will use, otherwise the first live
+                        # call recompiles all variants. DeepSeek-R1 TP8
+                        # is 16 Q heads per rank.
+                        _gluon_mla_prewarm(
+                            device=torch.device(
+                                f"cuda:{torch.cuda.current_device()}"
+                            ),
+                            num_heads=self.num_head,
+                            verbose=False,
+                        )
+                    except Exception as _e:
+                        logger.warning(f"Gluon MLA prewarm failed: {_e!r}")
+                    logger.info(
+                        "AITER: using Gluon MLA prefill in place of "
+                        "mla_prefill_ps_asm_fwd + mla_reduce_v1 "
+                        f"(sched={os.environ.get('SGLANG_AITER_GLUON_MLA_SCHED', 'hybrid')})"
+                    )
+                else:
+                    logger.warning(
+                        "SGLANG_AITER_USE_GLUON_MLA_PREFILL set but Gluon MLA "
+                        "kernels not importable. Falling back to ASM."
+                    )
+                    self._use_gluon_for_mla_prefill = False
+            except Exception as e:
+                logger.warning(
+                    f"SGLANG_AITER_USE_GLUON_MLA_PREFILL set but Gluon MLA "
+                    f"wrapper failed to import: {e!r}. Falling back to ASM."
+                )
+                self._use_gluon_for_mla_prefill = False
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -600,6 +658,32 @@ class AiterAttnBackend(AttentionBackend):
             k = k.to(fp8_dtype)
         if v.dtype != fp8_dtype:
             v = v.to(fp8_dtype)
+
+        # Gluon fast path: single-kernel attention + reduce, no
+        # workspace logits/LSE buffers. Only handles D_QK=192 / D_V=128
+        # (DeepSeek V3/R1 MLA). Anything else falls through to the ASM
+        # path below. Also disabled when forward_extend has marked
+        # `_gluon_mla_allowed=False` (see MTP `capture_hidden_mode=FULL`
+        # gate in `forward_extend`).
+        if (
+            self._gluon_mla_prefill_fn is not None
+            and getattr(self, "_gluon_mla_allowed", True)
+            and q.shape[-1] == 192
+            and v.shape[-1] == 128
+        ):
+            output = self._gluon_mla_prefill_fn(
+                q=q,
+                k=k,
+                v=v,
+                qo_indptr=self.forward_metadata.qo_indptr,
+                kv_indptr=self.forward_metadata.kv_indptr,
+                sm_scale=layer.scaling,
+                num_heads=nhead,
+                v_head_dim=v_head_dim,
+                input_dtype=self.input_dtype,
+            )[0]
+            return output
+
         one_scale = torch.ones((), dtype=torch.float32, device=q.device)
 
         tile_q = 256
