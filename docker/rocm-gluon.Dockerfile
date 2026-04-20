@@ -22,17 +22,27 @@
 #
 #   # MLA prefill branch (D192 / DeepSeek R1 prefill replacement)
 #   docker build \
-#     --build-arg SGL_FORK=https://github.com/tussingh/sglang.git \
+#     --build-arg SGL_FORK=https://github.com/realvideogame2/sglang.git \
 #     --build-arg SGL_BRANCH=tussingh/gluon-mla-prefill \
 #     -t sglang-gluon-mla:rocm700-mi35x \
 #     -f docker/rocm-gluon.Dockerfile .
 #
 #   # Extend-attention branch (BF16 + FP8-KV extend path)
 #   docker build \
-#     --build-arg SGL_FORK=https://github.com/tussingh/sglang.git \
+#     --build-arg SGL_FORK=https://github.com/realvideogame2/sglang.git \
 #     --build-arg SGL_BRANCH=tussingh/gluon-extend-attn \
 #     -t sglang-gluon-extend:rocm700-mi35x \
 #     -f docker/rocm-gluon.Dockerfile .
+#
+# Or pull the Dockerfile directly off the branch without a local checkout:
+#
+#   curl -fsSL https://raw.githubusercontent.com/realvideogame2/sglang/tussingh/gluon-mla-prefill/docker/rocm-gluon.Dockerfile \
+#     -o rocm-gluon.Dockerfile
+#   docker build \
+#     --build-arg SGL_FORK=https://github.com/realvideogame2/sglang.git \
+#     --build-arg SGL_BRANCH=tussingh/gluon-mla-prefill \
+#     -t sglang-gluon-mla:rocm700-mi35x \
+#     -f rocm-gluon.Dockerfile .
 #
 # Runtime
 # -------
@@ -67,7 +77,7 @@
 ARG BASE_IMAGE=rocm/sgl-dev:v0.5.10rc0-rocm700-mi35x-20260409
 FROM ${BASE_IMAGE}
 
-ARG SGL_FORK=https://github.com/tussingh/sglang.git
+ARG SGL_FORK=https://github.com/realvideogame2/sglang.git
 ARG SGL_BRANCH=tussingh/gluon-mla-prefill
 
 LABEL org.opencontainers.image.title="sglang-gluon-mi350x"
@@ -79,9 +89,10 @@ LABEL gluon.rocm.version="7.0.0"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+# Native gfx950 detection works on MI350X/MI355 under ROCm 7.0 — do NOT
+# set HSA_OVERRIDE_GFX_VERSION here (setting e.g. 11.0.0 would force
+# the runtime to compile for gfx1100 / RDNA3 and break everything).
 ENV PYTORCH_ROCM_ARCH=gfx950
-ENV HSA_OVERRIDE_GFX_VERSION=11.0.0
-ENV HIP_VISIBLE_DEVICES=all
 
 # Default Gluon knobs. Override at docker run time with -e.
 # Unset USE_GLUON to fall back to pure ASM for A/B comparison.
